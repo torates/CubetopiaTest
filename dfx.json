@@ -4,18 +4,9 @@
       "main": "src/Cubetopia/main.mo",
       "type": "motoko"
     },
-    "Cubetopia_assets": {
-      "dependencies": [
-        "Cubetopia"
-      ],
-      "frontend": {
-        "entrypoint": "src/Cubetopia_assets/src/index.html"
-      },
-      "source": [
-        "src/Cubetopia_assets/assets",
-        "dist/Cubetopia_assets/"
-      ],
-      "type": "assets"
+    "NFT" : {
+      "main": "src/CubetopiaNFT/main.mo",
+      "type": "motoko"
     }
   },
   "defaults": {

@@ -1,254 +1,333 @@
-import Error "mo:base/Error";
-import Hash "mo:base/Hash";
+/*
+ERC721 - note the following:
+-No notifications (can be added)
+-All tokenids are ignored
+-You can use the canister address as the token id
+-Memo is ignored
+-No transferFrom (as transfer includes a from field)
+*/
+
+import Cycles "mo:base/ExperimentalCycles";
 import HashMap "mo:base/HashMap";
-import Nat "mo:base/Nat";
-import Option "mo:base/Option";
 import Principal "mo:base/Principal";
-import Array "mo:base/Array";
+import Int8 "mo:base/Int8";
+import Buffer "mo:base/Buffer";
+import Text "mo:base/Text";
+import Blob "mo:base/Blob";
+import Result "mo:base/Result";
 import Iter "mo:base/Iter";
-import T "dip721_types";
+import AID "../motoko/util/AccountIdentifier";
+import ExtCore "../motoko/ext/Core";
+import ExtCommon "../motoko/ext/Common";
+import ExtAllowance "../motoko/ext/Allowance";
+import ExtNonFungible "../motoko/ext/NonFungible";
 
-actor class NFT(_name : Text, _symbol : Text) {
-    private stable var tokenPk : Nat = 0;
+import AssetStorage "assetstorage";
 
-    private stable var tokenURIEntries : [(T.TokenId, Text)] = [];
-    private stable var ownersEntries : [(T.TokenId, Principal)] = [];
-    private stable var balancesEntries : [(Principal, Nat)] = [];
-    private stable var tokenApprovalsEntries : [(T.TokenId, Principal)] = [];
-    private stable var operatorApprovalsEntries : [(Principal, [Principal])] = [];
+////import AccountIdentifier "mo:principal/AccountIdentifier";
+////import Cap "mo:cap/Cap";
+////import CapRouter "mo:cap/Router";
+////import EXT "mo:ext/Ext";
 
-    private let tokenURIs : HashMap.HashMap<T.TokenId, Text> = HashMap.fromIter<T.TokenId, Text>(tokenURIEntries.vals(), 10, Nat.equal, Hash.hash);
-    private let owners : HashMap.HashMap<T.TokenId, Principal> = HashMap.fromIter<T.TokenId, Principal>(ownersEntries.vals(), 10, Nat.equal, Hash.hash);
-    private let balances : HashMap.HashMap<Principal, Nat> = HashMap.fromIter<Principal, Nat>(balancesEntries.vals(), 10, Principal.equal, Principal.hash);
-    private let tokenApprovals : HashMap.HashMap<T.TokenId, Principal> = HashMap.fromIter<T.TokenId, Principal>(tokenApprovalsEntries.vals(), 10, Nat.equal, Hash.hash);
-    private let operatorApprovals : HashMap.HashMap<Principal, [Principal]> = HashMap.fromIter<Principal, [Principal]>(operatorApprovalsEntries.vals(), 10, Principal.equal, Principal.hash);
+//import Admins "../Admins";
+//import AssetTypes "../Assets/types";
+//import Assets "../Assets";
+//import Entrepot "../Entrepot";
+//import EntrepotTypes "../Entrepot/types";
+//import Ext "../Ext";
+//import ExtTypes "../Ext/types";
+//import Hex "../NNS/Hex";
+//import Http "../Http";
+//import HttpTypes "../Http/types";
+//import NNS "../NNS";
+//import NNSTypes "../NNS/types";
+//import Payouts "../Payouts";
+//import PayoutsTypes "../Payouts/types";
+//import PublicSale "../PublicSale";
+//import PublicSaleTypes "../PublicSale/types";
+//import TokenTypes "../Tokens/types";
+//import Tokens "../Tokens";
 
-    public shared func balanceOf(p : Principal) : async ?Nat {
-        return balances.get(p);
+shared (install) actor class erc721_token(init_minter: Principal) = this {
+  
+  // Types
+  type AccountIdentifier = ExtCore.AccountIdentifier;
+  type SubAccount = ExtCore.SubAccount;
+  type User = ExtCore.User;
+  type Balance = ExtCore.Balance;
+  type TokenIdentifier = ExtCore.TokenIdentifier;
+  type TokenIndex  = ExtCore.TokenIndex ;
+  type Extension = ExtCore.Extension;
+  type CommonError = ExtCore.CommonError;
+  type BalanceRequest = ExtCore.BalanceRequest;
+  type BalanceResponse = ExtCore.BalanceResponse;
+  type TransferRequest = ExtCore.TransferRequest;
+  type TransferResponse = ExtCore.TransferResponse;
+  type AllowanceRequest = ExtAllowance.AllowanceRequest;
+  type ApproveRequest = ExtAllowance.ApproveRequest;
+  type Metadata = ExtCommon.Metadata;
+  type MintRequest  = ExtNonFungible.MintRequest ;
+  
+  private let EXTENSIONS : [Extension] = ["@ext/common", "@ext/allowance", "@ext/nonfungible"];
+
+
+  
+  //State work
+  private stable var _registryState : [(TokenIndex, AccountIdentifier)] = [];
+  private var _registry : HashMap.HashMap<TokenIndex, AccountIdentifier> = HashMap.fromIter(_registryState.vals(), 0, ExtCore.TokenIndex.equal, ExtCore.TokenIndex.hash);
+	
+  private stable var _allowancesState : [(TokenIndex, Principal)] = [];
+  private var _allowances : HashMap.HashMap<TokenIndex, Principal> = HashMap.fromIter(_allowancesState.vals(), 0, ExtCore.TokenIndex.equal, ExtCore.TokenIndex.hash);
+	
+  private stable var _tokenMetadataState : [(TokenIndex, Metadata)] = [];
+  private var _tokenMetadata : HashMap.HashMap<TokenIndex, Metadata> = HashMap.fromIter(_tokenMetadataState.vals(), 0, ExtCore.TokenIndex.equal, ExtCore.TokenIndex.hash);
+  
+  private stable var _supply : Balance  = 0;
+  private stable var maxSupply : Nat = 3000;
+  private stable var _minter : Principal  = init_minter;
+  private stable var _nextTokenId : TokenIndex  = 0;
+  private var value = 0;
+
+  //State functions
+  system func preupgrade() {
+    _registryState := Iter.toArray(_registry.entries());
+    _allowancesState := Iter.toArray(_allowances.entries());
+    _tokenMetadataState := Iter.toArray(_tokenMetadata.entries());
+  };
+  system func postupgrade() {
+    _registryState := [];
+    _allowancesState := [];
+    _tokenMetadataState := [];
+  };
+
+	public shared(msg) func setMinter(minter : Principal) : async () {
+		assert(msg.caller == _minter);
+		_minter := minter;
+	};
+
+
+  public func inc() : async Nat {
+    value += 1;
+    return value;
+  };
+
+  public func toBytes(_id: Text) : async Blob {
+      return Text.encodeUtf8(_id);
+  };
+ 
+  public func tokenIdentifier(c : Text, i : TokenIndex) : async TokenIdentifier {
+    return ExtCore.TokenIdentifier.fromText(c, i);
+  };
+
+  
+	
+  public shared(msg) func mintNFT(request : MintRequest) : async TokenIndex {
+	assert(msg.caller == _minter);
+    let receiver = ExtCore.User.toAID(request.to);
+    let token = _nextTokenId;
+    let md : Metadata = #nonfungible({
+        metadata = request.metadata;
+    }); 
+    _registry.put(token, receiver);
+    _tokenMetadata.put(token, md);
+    _supply := _supply + 1;
+    _nextTokenId := _nextTokenId + 1;
+    token;
+	};
+
+
+  public shared(msg) func transfer(request: TransferRequest) : async TransferResponse {
+    if (request.amount != 1) {
+			return #err(#Other("Must use amount of 1"));
+	};
+    if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+        return #err(#InvalidToken(request.token));
     };
+    let token = ExtCore.TokenIdentifier.getIndex(request.token);
+    let owner = ExtCore.User.toAID(request.from);
+    let spender = AID.fromPrincipal(msg.caller, request.subaccount);
+    let receiver = ExtCore.User.toAID(request.to);
+		
+    switch (_registry.get(token)) {
+      case (?token_owner) {
+				if(AID.equal(owner, token_owner) == false) {
+					return #err(#Unauthorized(owner));
+				};
+				if (AID.equal(owner, spender) == false) {
+					switch (_allowances.get(token)) {
+						case (?token_spender) {
+							if(Principal.equal(msg.caller, token_spender) == false) {								
+								return #err(#Unauthorized(spender));
+							};
+						};
+						case (_) {
+							return #err(#Unauthorized(spender));
+						};
+					};
+				};
+				_allowances.delete(token);
+				_registry.put(token, receiver);
+				return #ok(request.amount);
+      };
+      case (_) {
+        return #err(#InvalidToken(request.token));
+      };
+    };
+  };
+  
+  public shared(msg) func approve(request: ApproveRequest) : async () {
+		if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+			return;
+		};
+		let token = ExtCore.TokenIdentifier.getIndex(request.token);
+    let owner = AID.fromPrincipal(msg.caller, request.subaccount);
+		switch (_registry.get(token)) {
+      case (?token_owner) {
+				if(AID.equal(owner, token_owner) == false) {
+					return;
+				};
+				_allowances.put(token, request.spender);
+        return;
+      };
+      case (_) {
+        return;
+      };
+    };
+  };
 
-    public shared func owns(p : Principal) : async Bool {
-        switch(balances.get(p)) {
-            case (?balance) {
-                return true;
-            };
-            case (_) {
-                return false;
-            };
+  public query func extensions() : async [Extension] {
+    EXTENSIONS;
+  };
+  
+  public query func balance(request : BalanceRequest) : async BalanceResponse {
+		if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(request.token));
+		};
+		let token = ExtCore.TokenIdentifier.getIndex(request.token);
+    let aid = ExtCore.User.toAID(request.user);
+    switch (_registry.get(token)) {
+      case (?token_owner) {
+				if (AID.equal(aid, token_owner) == true) {
+					return #ok(1);
+				} else {					
+					return #ok(0);
+				};
+      };
+      case (_) {
+        return #err(#InvalidToken(request.token));
+      };
+    };
+  };
+	
+	public query func allowance(request : AllowanceRequest) : async Result.Result<Balance, CommonError> {
+		if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(request.token));
+		};
+		let token = ExtCore.TokenIdentifier.getIndex(request.token);
+		let owner = ExtCore.User.toAID(request.owner);
+		switch (_registry.get(token)) {
+      case (?token_owner) {
+				if (AID.equal(owner, token_owner) == false) {					
+					return #err(#Other("Invalid owner"));
+				};
+				switch (_allowances.get(token)) {
+					case (?token_spender) {
+						if (Principal.equal(request.spender, token_spender) == true) {
+							return #ok(1);
+						} else {					
+							return #ok(0);
+						};
+					};
+					case (_) {
+						return #ok(0);
+					};
+				};
+      };
+      case (_) {
+        return #err(#InvalidToken(request.token));
+      };
+    };
+  };
+  
+	public query func bearer(token : TokenIdentifier) : async Result.Result<AccountIdentifier, CommonError> {
+		if (ExtCore.TokenIdentifier.isPrincipal(token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(token));
+		};
+		let tokenind = ExtCore.TokenIdentifier.getIndex(token);
+    switch (_registry.get(tokenind)) {
+      case (?token_owner) {
+				return #ok(token_owner);
+      };
+      case (_) {
+        return #err(#InvalidToken(token));
+      };
+    };
+	};
+  
+	public query func supply(token : TokenIdentifier) : async Result.Result<Balance, CommonError> {
+    #ok(_supply);
+  };
+  
+  public query func getRegistry() : async [(TokenIndex, AccountIdentifier)] {
+    Iter.toArray(_registry.entries());
+  };
+  public query func getAllowances() : async [(TokenIndex, Principal)] {
+    Iter.toArray(_allowances.entries());
+  };
+  public query func getTokens() : async [(TokenIndex, Metadata)] {
+    Iter.toArray(_tokenMetadata.entries());
+  };
+
+  
+  
+  public query func metadata(token : TokenIdentifier) : async Result.Result<Metadata, CommonError> {
+    if (ExtCore.TokenIdentifier.isPrincipal(token, Principal.fromActor(this)) == false) {
+			return #err(#InvalidToken(token));
+	};
+	let tokenind = ExtCore.TokenIdentifier.getIndex(token);
+    switch (_tokenMetadata.get(tokenind)) {
+      case (?token_metadata) {
+				return #ok(token_metadata);
+      };
+      case (_) {
+        return #err(#InvalidToken(token));
+      };
+    };
+  };
+
+  public query func http_request(request : HttpRequest) : async HttpResponse {
+    let path = Iter.toArray(Text.tokens(request.url, #text("/")));
+    switch(_getTokenData(_getParam(request.url, "tokenid"))) {
+      case (?metadata) {
+        return {
+          status_code = 200;
+          headers = [("content-type", "image/jpeg")];
+          body = metadata
+        }
+      };
+      case (_) {
+        return {
+          status_code = 200;
+          headers = [("content-type", "text/plain")];
+          body = Text.encodeUtf8 (
+            "Cycle Balance:                            ~" # debug_show (Cycles.balance()/1000000000000) # "T\n" #
+            "Wrapped NFTs:                             " # debug_show (_registry.size()) # "\n" #
+          )
         };
+      };
     };
-
-    public shared func ownerOf(tokenId : T.TokenId) : async ?Principal {
-        return _ownerOf(tokenId);
-    };
-
-    public shared query func tokenURI(tokenId : T.TokenId) : async ?Text {
-        return _tokenURI(tokenId);
-    };
-
-    public shared query func name() : async Text {
-        return _name;
-    };
-
-    public shared query func symbol() : async Text {
-        return _symbol;
-    };
-
-    public shared func isApprovedForAll(owner : Principal, opperator : Principal) : async Bool {
-        return _isApprovedForAll(owner, opperator);
-    };
-
-    public shared(msg) func approve(to : Principal, tokenId : T.TokenId) : async () {
-        switch(_ownerOf(tokenId)) {
-            case (?owner) {
-                 assert to != owner;
-                 assert msg.caller == owner or _isApprovedForAll(owner, msg.caller);
-                 _approve(to, tokenId);
-            };
-            case (null) {
-                throw Error.reject("No owner for token")
-            };
-        }
-    };
-
-    public shared func getApproved(tokenId : Nat) : async Principal {
-        switch(_getApproved(tokenId)) {
-            case (?v) { return v };
-            case null { throw Error.reject("None approved")}
-        }
-    };
-
-    public shared(msg) func setApprovalForAll(op : Principal, isApproved : Bool) : () {
-        assert msg.caller != op;
-
-        switch (isApproved) {
-            case true {
-                switch (operatorApprovals.get(msg.caller)) {
-                    case (?opList) {
-                        var array = Array.filter<Principal>(opList,func (p) { p != op });
-                        array := Array.append<Principal>(array, [op]);
-                        operatorApprovals.put(msg.caller, array);
-                    };
-                    case null {
-                        operatorApprovals.put(msg.caller, [op]);
-                    };
-                };
-            };
-            case false {
-                switch (operatorApprovals.get(msg.caller)) {
-                    case (?opList) {
-                        let array = Array.filter<Principal>(opList, func(p) { p != op });
-                        operatorApprovals.put(msg.caller, array);
-                    };
-                    case null {
-                        operatorApprovals.put(msg.caller, []);
-                    };
-                };
-            };
-        };
-        
-    };
-
-    public shared(msg) func transferFrom(from : Principal, to : Principal, tokenId : Nat) : () {
-        assert _isApprovedOrOwner(msg.caller, tokenId);
-
-        _transfer(from, to, tokenId);
-    };
-
-    public shared(msg) func mint(p: Principal, uri : Text) : async Nat {
-        tokenPk += 1;
-        _mint(p, tokenPk, uri);
-        return tokenPk;
-    };
+  };
+  
+  //Internal cycle management - good general case
+  public func acceptCycles() : async () {
+    let available = Cycles.available();
+    let accepted = Cycles.accept(available);
+    assert (accepted == available);
+  };
+  public query func availableCycles() : async Nat {
+    return Cycles.balance();
+  };
+}
 
 
-    // Internal
-
-    private func _ownerOf(tokenId : T.TokenId) : ?Principal {
-        return owners.get(tokenId);
-    };
-
-    private func _tokenURI(tokenId : T.TokenId) : ?Text {
-        return tokenURIs.get(tokenId);
-    };
-
-    private func _isApprovedForAll(owner : Principal, opperator : Principal) : Bool {
-        switch (operatorApprovals.get(owner)) {
-            case(?whiteList) {
-                for (allow in whiteList.vals()) {
-                    if (allow == opperator) {
-                        return true;
-                    };
-                };
-            };
-            case null {return false;};
-        };
-        return false;
-    };
-
-    private func _approve(to : Principal, tokenId : Nat) : () {
-        tokenApprovals.put(tokenId, to);
-    };
-
-    private func _removeApprove(tokenId : Nat) : () {
-        let _ = tokenApprovals.remove(tokenId);
-    };
-
-    private func _exists(tokenId : Nat) : Bool {
-        return Option.isSome(owners.get(tokenId));
-    };
-
-    private func _getApproved(tokenId : Nat) : ?Principal {
-        assert _exists(tokenId) == true;
-        switch(tokenApprovals.get(tokenId)) {
-            case (?v) { return ?v };
-            case null {
-                return null;
-            };
-        }
-    };
-
-    private func _hasApprovedAndSame(tokenId : Nat, spender : Principal) : Bool {
-        switch(_getApproved(tokenId)) {
-            case (?v) {
-                return v == spender;
-            };
-            case null { return false}
-        }
-    };
-
-    private func _isApprovedOrOwner(spender : Principal, tokenId : Nat) : Bool {
-        assert _exists(tokenId);
-        let owner = Option.unwrap(_ownerOf(tokenId));
-        return spender == owner or _hasApprovedAndSame(tokenId, spender) or _isApprovedForAll(owner, spender);
-    };
-
-    private func _transfer(from : Principal, to : Principal, tokenId : Nat) : () {
-        assert _exists(tokenId);
-        assert Option.unwrap(_ownerOf(tokenId)) == from;
-
-        // Bug in HashMap https://github.com/dfinity/motoko-base/pull/253/files
-        // this will throw unless you patch your file
-        _removeApprove(tokenId);
-
-        _decrementBalance(from);
-        _incrementBalance(to);
-        owners.put(tokenId, to);
-    };
-
-    private func _incrementBalance(address : Principal) {
-        switch (balances.get(address)) {
-            case (?v) {
-                balances.put(address, v + 1);
-            };
-            case null {
-                balances.put(address, 1);
-            }
-        }
-    };
-
-    private func _decrementBalance(address : Principal) {
-        switch (balances.get(address)) {
-            case (?v) {
-                balances.put(address, v - 1);
-            };
-            case null {
-                balances.put(address, 0);
-            }
-        }
-    };
-
-    private func _mint(to : Principal, tokenId : Nat, uri : Text) : () {
-        assert not _exists(tokenId);
-
-        _incrementBalance(to);
-        owners.put(tokenId, to);
-        tokenURIs.put(tokenId,uri)
-    };
-
-    private func _burn(tokenId : Nat) {
-        let owner = Option.unwrap(_ownerOf(tokenId));
-
-        _removeApprove(tokenId);
-        _decrementBalance(owner);
-
-        ignore owners.remove(tokenId);
-    };
-
-    system func preupgrade() {
-        tokenURIEntries := Iter.toArray(tokenURIs.entries());
-        ownersEntries := Iter.toArray(owners.entries());
-        balancesEntries := Iter.toArray(balances.entries());
-        tokenApprovalsEntries := Iter.toArray(tokenApprovals.entries());
-        operatorApprovalsEntries := Iter.toArray(operatorApprovals.entries());
-        
-    };
-
-    system func postupgrade() {
-        tokenURIEntries := [];
-        ownersEntries := [];
-        balancesEntries := [];
-        tokenApprovalsEntries := [];
-        operatorApprovalsEntries := [];
-    };
-};
+// possibble solution, premint 3k icflower nfts, to an address

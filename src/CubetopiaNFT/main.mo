@@ -21,7 +21,7 @@ import ExtCore "../motoko/ext/Core";
 import ExtCommon "../motoko/ext/Common";
 import ExtAllowance "../motoko/ext/Allowance";
 import ExtNonFungible "../motoko/ext/NonFungible";
-
+import Array "mo:base/Array";
 import AssetStorage "assetstorage";
 
 ////import AccountIdentifier "mo:principal/AccountIdentifier";
@@ -66,7 +66,8 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
   type AllowanceRequest = ExtAllowance.AllowanceRequest;
   type ApproveRequest = ExtAllowance.ApproveRequest;
   type Metadata = ExtCommon.Metadata;
-  type MintRequest  = ExtNonFungible.MintRequest ;
+  type MintRequest  = ExtNonFungible.MintRequest;
+  type TokensOwned = [TokenIndex];
   
   private let EXTENSIONS : [Extension] = ["@ext/common", "@ext/allowance", "@ext/nonfungible"];
 
@@ -81,6 +82,9 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
 	
   private stable var _tokenMetadataState : [(TokenIndex, Metadata)] = [];
   private var _tokenMetadata : HashMap.HashMap<TokenIndex, Metadata> = HashMap.fromIter(_tokenMetadataState.vals(), 0, ExtCore.TokenIndex.equal, ExtCore.TokenIndex.hash);
+
+  private stable var _userOwned : [(Principal, TokensOwned)] = [];
+  private var _owneduser : HashMap.HashMap<Principal, TokensOwned> = HashMap.fromIter(_userOwned.vals(), 0, Principal.equal, Principal.hash);
   
   private stable var _supply : Balance  = 0;
   private stable var maxSupply : Nat = 3000;
@@ -91,11 +95,13 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
   //State functions
   system func preupgrade() {
     _registryState := Iter.toArray(_registry.entries());
+    _userOwned := Iter.toArray(_owneduser.entries());
     _allowancesState := Iter.toArray(_allowances.entries());
     _tokenMetadataState := Iter.toArray(_tokenMetadata.entries());
   };
   system func postupgrade() {
     _registryState := [];
+    _userOwned := [];
     _allowancesState := [];
     _tokenMetadataState := [];
   };
@@ -119,7 +125,16 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
     return ExtCore.TokenIdentifier.fromText(c, i);
   };
 
-  
+  public shared(msg) func getNftsByUser(id : Principal) : async [TokenIndex] {
+      switch(_owneduser.get(id)) {
+          case(?val) {
+              return val;
+          };
+          case(_) {
+              return [];
+          };
+      };
+  };
 	
   public shared(msg) func mintNFT(request : MintRequest) : async TokenIndex {
 	assert(msg.caller == _minter);
@@ -129,6 +144,16 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
         metadata = request.metadata;
     }); 
     _registry.put(token, receiver);
+    switch(_owneduser.get(msg.caller)) {
+        case(?val) {
+            var tokenstoPut : TokensOwned = [];
+            tokenstoPut := Array.append(val, [token]);
+            _owneduser.put(msg.caller, tokenstoPut);
+        };
+        case(_) {
+            _owneduser.put(msg.caller, [token])
+        };
+    };
     _tokenMetadata.put(token, md);
     _supply := _supply + 1;
     _nextTokenId := _nextTokenId + 1;
@@ -200,10 +225,10 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
   };
   
   public query func balance(request : BalanceRequest) : async BalanceResponse {
-		if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
-			return #err(#InvalidToken(request.token));
-		};
-		let token = ExtCore.TokenIdentifier.getIndex(request.token);
+    if (ExtCore.TokenIdentifier.isPrincipal(request.token, Principal.fromActor(this)) == false) {
+        return #err(#InvalidToken(request.token));
+    };
+    let token = ExtCore.TokenIdentifier.getIndex(request.token);
     let aid = ExtCore.User.toAID(request.user);
     switch (_registry.get(token)) {
       case (?token_owner) {
@@ -295,6 +320,14 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
     };
   };
 
+
+  let NOT_FOUND : HttpResponse = {status_code = 404; headers = []; body = []; streaming_strategy = null};
+  let BAD_REQUEST : HttpResponse = {status_code = 400; headers = []; body = []; streaming_strategy = null};
+
+
+  type HttpRequest = AssetStorage.HttpRequest;
+  type HttpResponse = AssetStorage.HttpResponse;
+  
   public query func http_request(request : HttpRequest) : async HttpResponse {
     let path = Iter.toArray(Text.tokens(request.url, #text("/")));
     switch(_getTokenData(_getParam(request.url, "tokenid"))) {
@@ -302,21 +335,69 @@ shared (install) actor class erc721_token(init_minter: Principal) = this {
         return {
           status_code = 200;
           headers = [("content-type", "image/jpeg")];
-          body = metadata
-        }
+          body = Blob.toArray(metadata);
+          streaming_strategy = null;
+        };
       };
       case (_) {
         return {
           status_code = 200;
           headers = [("content-type", "text/plain")];
-          body = Text.encodeUtf8 (
+          body = Blob.toArray(Text.encodeUtf8(
             "Cycle Balance:                            ~" # debug_show (Cycles.balance()/1000000000000) # "T\n" #
-            "Wrapped NFTs:                             " # debug_show (_registry.size()) # "\n" #
-          )
+            "Wrapped NFTs:                             " # debug_show (_registry.size())
+          ));
+          streaming_strategy = null;
         };
       };
     };
   };
+
+  func _getTokenData(tokenid : ?Text) : ?Blob {
+    switch (tokenid) {
+      case (?token) {
+        if (ExtCore.TokenIdentifier.isPrincipal(token, Principal.fromActor(this)) == false) {
+          return null;
+        };
+        let tokenind = ExtCore.TokenIdentifier.getIndex(token);
+        switch (_tokenMetadata.get(tokenind)) {
+          case (?token_metadata) {
+            switch(token_metadata) {
+              case (#fungible data) return null;
+              case (#nonfungible data) return data.metadata;
+            };
+          };
+          case (_) {
+            return null;
+          };
+        };
+				return null;
+      };
+      case (_) {
+        return null;
+      };
+    };
+  };
+  func _getParam(url : Text, param : Text) : ?Text {
+    var _s : Text = url;
+    Iter.iterate<Text>(Text.split(_s, #text("/")), func(x, _i) {
+      _s := x;
+    });
+    Iter.iterate<Text>(Text.split(_s, #text("?")), func(x, _i) {
+      if (_i == 1) _s := x;
+    });
+    var t : ?Text = null;
+    var found : Bool = false;
+    Iter.iterate<Text>(Text.split(_s, #text("&")), func(x, _i) {
+      Iter.iterate<Text>(Text.split(x, #text("=")), func(y, _ii) {
+        if (_ii == 0) {
+          if (Text.equal(y, param)) found := true;
+        } else if (found == true) t := ?y;
+      });
+    });
+    return t;
+  };
+
   
   //Internal cycle management - good general case
   public func acceptCycles() : async () {

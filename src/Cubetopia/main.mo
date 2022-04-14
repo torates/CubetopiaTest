@@ -13,7 +13,7 @@ actor class map(admin : Principal) {
   type Island = Island.Island;
   type Block = Types.Block;
 
-  let nftcan : NFT.Self = actor "7ugp6-maaaa-aaaah-abdfq-cai";
+  let nftcan : NFT.Self = actor "aapup-qaaaa-aaaah-abbnq-cai";
   
 
   private stable var _registryState : [(Principal, Island)] = [];
@@ -23,7 +23,7 @@ actor class map(admin : Principal) {
 
   public shared(msg) func generateIsland(user : Principal) : async Island {
     (assert msg.caller == _admin);
-    switch (await nftcan.owns(user)) {
+    switch (await nftcan.getNftsByUser(user)) {
       case true {
         let cycleShare = 1_000_000_000_000;
         Cycles.add(cycleShare);
